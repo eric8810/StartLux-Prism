@@ -206,7 +206,7 @@ def _attn_part_kernel(q_ptr, kv_ptr, k_base0, kind_stride, head_stride, kv8s_ptr
                       kv8_head_stride, kvs_ptr, kvl_ptr, pm_ptr, pa_ptr, n_ptr,
                       MAXS, H: tl.constexpr, HKV: tl.constexpr, HD: tl.constexpr, G: tl.constexpr, GP: tl.constexpr,
                       SPLIT: tl.constexpr, BN: tl.constexpr, NP: tl.constexpr, SCALE: tl.constexpr,
-                      KV8: tl.constexpr):
+                      KV8: tl.constexpr, KV4: tl.constexpr, KVF8: tl.constexpr):
     """Decode attention, first half: per (row, kv head, program p) the splits p, p + NP, ... of SPLIT keys of the
     row's KV range, the G query heads of the kv head together (each key read once): per split the running max, the
     softmax sum (in pm: [rows, HKV, MAXS, G, 2]) and the unnormalized output (pa: [rows, HKV, MAXS, G, HD])."""
@@ -235,10 +235,27 @@ def _attn_part_kernel(q_ptr, kv_ptr, k_base0, kind_stride, head_stride, kv8s_ptr
         for kb in range(s * SPLIT, end, BN):
             km = (kb + n) < end
             rows = (start + kb + n).to(tl.int64)
-            if KV8:
+            if KV4:
+                d2 = tl.arange(0, HD // 2)
+                kp = tl.load(kv_ptr + k_base + rows[:, None] * (HD // 2) + d2[None, :], mask=km[:, None], other=0)
+                lo = (kp & 0x0F).to(tl.int32)
+                hi = (kp >> 4).to(tl.int32)
+                code = tl.interleave(lo, hi)
+                cc = code & 7
+                mag = tl.where(cc < 4, 0.5 * cc.to(tl.float32), 0.0)
+                mag = tl.where(cc == 4, 2.0, tl.where(cc == 5, 3.0, tl.where(cc == 6, 4.0, tl.where(cc == 7, 6.0, mag))))
+                val = tl.where(code >= 8, -mag, mag)
+                ds = tl.arange(0, HD // 32)
+                kb8 = tl.load(kv8s_ptr + k8s_base + rows[:, None] * (HD // 32) + ds[None, :],
+                              mask=km[:, None], other=0)
+                sc4 = tl.exp2(kb8.to(tl.float32) - 127.0)
+                sc4 = tl.reshape(tl.broadcast_to(sc4[:, :, None], (BN, HD // 32, 32)), (BN, HD))
+                k = (val * sc4).to(tl.bfloat16)
+            elif KV8:
                 kq = tl.load(kv_ptr + k_base + rows[:, None] * HD + d[None, :], mask=km[:, None], other=0)
+                kf = kq.to(tl.float8e4nv, bitcast=True).to(tl.float32) if KVF8 else kq.to(tl.float32)
                 ks = tl.load(kv8s_ptr + k8s_base + rows, mask=km, other=0.0)
-                k = (kq.to(tl.float32) * ks[:, None]).to(tl.bfloat16)
+                k = (kf * ks[:, None]).to(tl.bfloat16)
             else:
                 k = tl.load(kv_ptr + k_base + rows[:, None] * HD + d[None, :], mask=km[:, None], other=0.0)
             sc = tl.dot(q, tl.trans(k)) * SCALE
@@ -247,10 +264,27 @@ def _attn_part_kernel(q_ptr, kv_ptr, k_base0, kind_stride, head_stride, kv8s_ptr
             alpha = tl.exp(m_i - m_new)
             pr = tl.exp(sc - m_new[:, None])
             l_i = l_i * alpha + tl.sum(pr, 1)
-            if KV8:
+            if KV4:
+                d2 = tl.arange(0, HD // 2)
+                vp = tl.load(kv_ptr + v_base + rows[:, None] * (HD // 2) + d2[None, :], mask=km[:, None], other=0)
+                lo = (vp & 0x0F).to(tl.int32)
+                hi = (vp >> 4).to(tl.int32)
+                code = tl.interleave(lo, hi)
+                cc = code & 7
+                mag = tl.where(cc < 4, 0.5 * cc.to(tl.float32), 0.0)
+                mag = tl.where(cc == 4, 2.0, tl.where(cc == 5, 3.0, tl.where(cc == 6, 4.0, tl.where(cc == 7, 6.0, mag))))
+                val = tl.where(code >= 8, -mag, mag)
+                ds = tl.arange(0, HD // 32)
+                vb8 = tl.load(kv8s_ptr + v8s_base + rows[:, None] * (HD // 32) + ds[None, :],
+                              mask=km[:, None], other=0)
+                sc4 = tl.exp2(vb8.to(tl.float32) - 127.0)
+                sc4 = tl.reshape(tl.broadcast_to(sc4[:, :, None], (BN, HD // 32, 32)), (BN, HD))
+                v = (val * sc4).to(tl.bfloat16)
+            elif KV8:
                 vq = tl.load(kv_ptr + v_base + rows[:, None] * HD + d[None, :], mask=km[:, None], other=0)
+                vf = vq.to(tl.float8e4nv, bitcast=True).to(tl.float32) if KVF8 else vq.to(tl.float32)
                 vs = tl.load(kv8s_ptr + v8s_base + rows, mask=km, other=0.0)
-                v = (vq.to(tl.float32) * vs[:, None]).to(tl.bfloat16)
+                v = (vf * vs[:, None]).to(tl.bfloat16)
             else:
                 v = tl.load(kv_ptr + v_base + rows[:, None] * HD + d[None, :], mask=km[:, None], other=0.0)
             acc = acc * alpha[:, None] + tl.dot(pr.to(tl.bfloat16), v)
@@ -303,7 +337,7 @@ def attn_scratch(B, max_len, cfg, device):
             torch.empty(B, cfg.n_kv_head, S, G, cfg.head_dim, dtype=torch.float32, device=device))
 
 
-def attention(qbuf, qkv, kv, attn_layer, kv_start, kv_len, scratch, out, n, B, cfg, kv8s=None):
+def attention(qbuf, qkv, kv, attn_layer, kv_start, kv_len, scratch, out, n, B, cfg, kv8s=None, kv_mode=0):
     """softmax(q K^T / sqrt(HD)) V over each row's KV rows kv_start .. kv_start + kv_len (its new key included), times
     sigmoid(gate) -> out bf16 [B, H * HD]."""
     H, HKV, HD = cfg.n_head, cfg.n_kv_head, cfg.head_dim
@@ -315,7 +349,8 @@ def attention(qbuf, qkv, kv, attn_layer, kv_start, kv_len, scratch, out, n, B, c
     _attn_part_kernel[(B, HKV, ATTN_PROGRAMS)](
         qbuf, kv, attn_layer * kv.stride(0), kv.stride(1), kv.stride(2), *kvs_args, kv_start, kv_len, pm, pa, n, S,
         H=H, HKV=HKV, HD=HD, G=G, GP=max(16, _p2(G)), SPLIT=ATTN_SPLIT, BN=64, NP=ATTN_PROGRAMS,
-        SCALE=HD ** -0.5, KV8=kv8s is not None, num_warps=4, num_stages=2)
+        SCALE=HD ** -0.5, KV8=kv_mode in (8, 16), KV4=kv_mode == 4, KVF8=kv_mode == 16, num_warps=4,
+        num_stages=2)
     _attn_combine_kernel[(B, H)](qkv, qkv.stride(0), kv_len, pm, pa, out, out.stride(0), n, S, H=H, HKV=HKV, HD=HD,
                                  G=G, SPLIT=ATTN_SPLIT, num_warps=2)
 
