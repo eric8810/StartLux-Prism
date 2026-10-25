@@ -463,3 +463,35 @@ STARTLUX_PRISM_MXFP4_MLP=$M/mxfp4/mlp_smooth.pt
 
 显存大头是激活缓冲区（`gu` 在 32k 时是 1.6GB），不是 KV。模型本身支持 262k 位置，但 16GB 卡上
 `--max-tokens` 24k 是实用上限、16k 是稳妥值。当前服务按 24,576 启动。
+
+## 18. FP4 GEMM 形状表（2026-10-25）
+
+照上游 W4A8 的做法，给 MXFP4 GEMM 加了按 GPU、按形状的配置表和重测工具：
+
+- `bench/w4a4_table.py`：对 MLP 的两个投影（gate|up `24576×4096`、down `4096×12288`）在 1–8,192 行、
+  epi 0/1（bf16 输出 / fp32 残差加）上逐个测 tile 配置，最快者写入
+  `startlux_prism/kernels/w4a4_table_<gpu>.json`（RTX 5060 Ti：`w4a4_table_rtx5060ti.json`）。
+- `kernels/w4a4.py:pick` 按 `(N, K, epi)` 取不小于当前行数的最小条目；没有条目时回退到原规则。
+  `STARTLUX_PRISM_W4A4_TABLE` 可指定别的表，`off` 关闭。
+- BK 固定 128，BM/BN 只决定哪个 program 算哪个元素，不改变 K 的累加顺序；表的每个条目都和默认配置
+  逐位比较（`--verify`），`tests/test_w4a4.py` 的 batch invariance 也仍然通过。
+
+RTX 5060 Ti 的收益（同一形状、同一行数，表 vs 原规则）：
+
+| 形状 | 行数 | 表 | 时间 | 规则 | 提升 |
+|---|---|---|---|---|---|
+| gate\|up | 1 | (64,32,8,4,3) | 0.21 ms | 0.22 ms | 1.04x |
+| gate\|up | 4,096 | (256,128,8,8,3) | 3.67 ms | 4.12 ms | 1.12x |
+| down | 1 | (32,128,8,4,3) | 0.11 ms | 0.13 ms | 1.19x |
+| down | 128 | (128,128,8,8,3) | 0.15 ms | 0.18 ms | 1.18x |
+| down | 4,096 | (256,128,8,8,3) | 1.99 ms | 2.07 ms | 1.04x |
+
+端到端（1,798 token 的随机 prompt，think_mode=never，同一二进制）：
+
+| 表 | 延迟（5 次中位数） |
+|---|---|
+| off | 234.0 ms |
+| **on** | **225.4 ms** |
+
+约 **1.038x**。收益不大，因为 MLP 只占 prefill 的一部分；表的价值是免去手工猜 tile，并在换卡时用
+`python bench/w4a4_table.py` 重测（`--recheck` 只对比表中条目与原规则）。

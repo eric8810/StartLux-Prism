@@ -11,6 +11,8 @@ same whatever the batch it is computed in (batch invariance).
 from __future__ import annotations
 
 import functools
+import json
+import os
 from typing import NamedTuple
 
 import torch
@@ -223,9 +225,35 @@ def pack_seq(w: MX4) -> MX4:
 
 # --------------------------------------------------------------------- GEMM
 
-def pick(M, N, K):
+@functools.lru_cache(None)
+def _table():
+    """{(N, K, epi): [(M, (BM, BN, GROUP_M, warps, stages)) by M]} measured by bench/w4a4_table.py on this GPU:
+    kernels/w4a4_table_<gpu tag>.json.  STARTLUX_PRISM_W4A4_TABLE names another file, or "off".  BK is not in the table:
+    it fixes the K order, and so the output bits, for every M and tile."""
+    from . import cuda_ext
+    path = os.environ.get("STARTLUX_PRISM_W4A4_TABLE") or cuda_ext.table_path("w4a4_table")
+    if path == "off" or not os.path.exists(path):
+        return {}
+    out = {}
+    for key, by_m in json.load(open(path))["table"].items():
+        n, k, epi = key.split(",")
+        out[(int(n), int(k), int(epi))] = sorted((int(m), tuple(int(v) for v in c)) for m, c in by_m.items())
+    return out
+
+
+def pick(M, N, K, epi=0):
     """(BM, BN, BK, GROUP_M, warps, stages) for a projection shape; BK fixed per (N, K) keeps the K order, and so the
-    output bits, the same for every M."""
+    output bits, the same for every M.  The table's choice for the smallest measured row count >= M (the largest
+    beyond them), or the rule for a shape it lacks."""
+    entries = _table().get((N, K, epi))
+    if entries:
+        bm, bn, group, warps, stages = next((c for m, c in entries if m >= M), entries[-1][1])
+        return (bm, bn, 128 if K % 128 == 0 else 32, group, warps, stages)
+    return pick_rule(M, N, K)
+
+
+def pick_rule(M, N, K):
+    """The table's fallback for a shape it lacks."""
     if N >= 8192:
         if M <= 64:
             return (64, 64, 128, 8, 8, 3)
@@ -309,7 +337,7 @@ def gemm8(a_q, a_s, w: MX4, out, n_rows, epi=0, out_stride=None):
     """a_q uint8 [n_rows, k] e4m3, a_s uint8 [n_rows, k/32]; w MX4 sequential-packed [N, k]."""
     M, K = n_rows, w.k
     N = w.n
-    BM, BN, BK, GROUP_M, warps, stages = pick(M, N, K)
+    BM, BN, BK, GROUP_M, warps, stages = pick(M, N, K, epi)
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
     outs = out.stride(0) if out_stride is None else out_stride
     _gemm8_kernel[grid](a_q, a_s, w.q, w.s, out, out, M, N=N, OUTS=outs, K=K, BM=BM, BN=BN, BK=BK,
@@ -321,7 +349,7 @@ def gemm(a_q, a_s, w: MX4, out, n_rows, epi=0, out_stride=None):
     into the fp32 residual `out` (which then holds [n_rows, N] fp32)."""
     M, K = n_rows, w.k
     N = w.n
-    BM, BN, BK, GROUP_M, warps, stages = pick(M, N, K)
+    BM, BN, BK, GROUP_M, warps, stages = pick(M, N, K, epi)
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
     outs = out.stride(0) if out_stride is None else out_stride
     _gemm_kernel[grid](a_q, a_s, w.q, w.s, out, out, M, N=N, OUTS=outs, K=K, BM=BM, BN=BN, BK=BK, GROUP_M=GROUP_M,
