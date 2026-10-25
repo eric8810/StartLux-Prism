@@ -72,12 +72,35 @@
 |---|---|---|
 | **MLP token 分块（已落地，CHUNK=4096）** | −89 KB | 逐 token 独立，不改数学；另加 0.36GB 固定缓冲。参考 vLLM chunked prefill、llama.cpp `-ub` |
 | 思考 KV 按实际 prompt+思考预算预留 | 0–0.7 GB | 不必等于 max-tokens；取决于实际最大输入 |
-| FP8 KV（主序列 + 思考） | −32 KB | 需要 attention kernel + 217 条质量评估；业界成熟 |
+| int8 KV（`--kv8`，已实现） | −16 KB/行 | 省 0.6GB@32k，但思考 token 2.8–3.2x；默认关闭，只用于非思考长上下文 |
 | `h`/`o` 改 bf16 | −16 KB | `h` 是残差主干，风险较高；只改 `o` 更稳 |
 
 四项后：固定约 7.9GB（+0.36GB 分块缓冲），增长 **118 KB/token**。
 
 参考实现：vLLM `--enable-chunked-prefill` / `--max-num-batched-tokens`、llama.cpp `-ub`、SGLang `--chunked-prefill-size`、TensorRT-LLM `enable_chunked_context`；融合 SwiGLU 参考 vLLM `SiluAndMul`、TensorRT-LLM gated MLP、Liger/xformers。
+
+### 3.1 int8 KV（`--kv8`）实测：不推荐用于 AutoThink
+
+实现：K/V 都存 int8（1 字节），每 (layer, kind, kv head, token) 一个 fp32 scale；attention kernel 里
+解回 bf16 再算。默认关闭。
+
+| 项 | bf16 KV | int8 KV |
+|---|---|---|
+| 32k 显存 | 13.8 GB | **13.2 GB**（−0.6GB） |
+| 2.3k 单请求（126 思考 token） | 约 3.6s | 约 3.9s |
+| 同 217 条 thinking 样本 | 76 | 82 |
+| 思考 token 总数（同 217 条） | 52,030 | **147,690** |
+| 两边都思考的 59 条平均 | 635 | **2,017** |
+| 217 条 gold | 66.8% | 70.5%（噪声内） |
+| 整轮评估耗时 | 1,293s | **4,114s（3.2x）** |
+
+结论：KV int8 只省 0.6GB，但让思考 token 涨 2.8–3.2 倍（大量撞到 4096 上限），整轮慢 3.2 倍。
+AutoThink 的思考路径对 KV 量化很敏感，标准 LLM 的 FP8 KV 结论不能直接套用。
+
+保留为 opt-in：
+
+- 适合：长上下文、`think_mode=never` 的批处理，显存是硬约束；
+- 不适合：交互式决策、AutoThink 默认服务。
 
 ## 4. 场景预估（四项优化后）
 
@@ -208,7 +231,7 @@
 
 1. ~~实现 MLP token 分块~~（已完成：32k 13.8GB、40k 15.1GB）。
 2. 思考 KV 预留改为按实际最大 prompt+思考预算。
-3. 评估 FP8 KV（质量 + kernel）。
+3. ~~评估 KV int8（`--kv8`）~~（已完成：省 0.6GB，但思考 3x，默认关闭）。
 4. `o` 先改 bf16；`h` 视质量再定。
 5. 完成 OpenRouter 细分：小模型、决策/分类类、上下文与价格分布。
 6. 若长上下文是产品目标：96GB PRO 做 256k；1M 放到 H200/B200 并验证 YaRN。

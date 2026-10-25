@@ -123,6 +123,7 @@ class Options:
                                     # 2-6% slower at 300-500 tokens, docs/optimizations.md)
     l2_prefetch_ctas: int = 32
     attn_qk8: bool = False          # int8: attention scores on int8 tensor cores (keys also kept as int8)
+    kv8: bool = False               # int8 K/V cache (1 byte each, one scale per token and kv head; decoded in-kernel)
     pdl: int = 512                  # int8: token / read buckets up to this size launch their CUDA GEMMs to overlap the
                                     # kernel before (0: off; the W4A8 path measured no gain)
     pdl_mode: int = 2               # 1 no weight prefetch, 2 the first k-tiles of each panel, 3 whole panels
@@ -579,8 +580,12 @@ class Engine:
         rows = KV_SCRATCH0 + T + (o.prefix_cache_tokens if n_cache else 0) + (o.think_kv_rows if n_think else 0)
         slots = 2 + n_cache + n_think
         out = dict(state=z(slots, n_gdn, HV, D, D), conv_state=z(slots, n_gdn, cfg.conv_kernel - 1, cfg.conv_dim),
-                   trans=z(o.max_trans, HV, D, D), kv=z(n_attn, 2, cfg.n_kv_head, rows, cfg.head_dim, dtype=bf))
-        if o.attn_qk8 and self.int8:                 # int8 keys and one scale per token and kv head
+                   trans=z(o.max_trans, HV, D, D),
+                   kv=z(n_attn, 2, cfg.n_kv_head, rows, cfg.head_dim,
+                         dtype=torch.int8 if o.kv8 else bf))
+        if o.kv8:                                    # one scale per (layer, kind, kv head, token)
+            out["kvs"] = z(n_attn, 2, cfg.n_kv_head, rows)
+        if o.attn_qk8 and self.int8 and not o.kv8:   # int8 keys and one scale per token and kv head
             out["k8"] = z(n_attn, cfg.n_kv_head, rows, cfg.head_dim, dtype=torch.int8)
             out["k8s"] = z(n_attn, cfg.n_kv_head, rows)
         P = max(cfg.conv_dim + cfg.value_dim + 2 * HV, self.qn + 2 * cfg.n_kv_head * cfg.head_dim)
@@ -701,7 +706,7 @@ class Engine:
         return T
 
     def _free_buffers(self):
-        for k in ("state", "conv_state", "trans", "kv", "k8", "buf", "_tabs", "tab", "counts", "cnt", "cache"):
+        for k in ("state", "conv_state", "trans", "kv", "kvs", "k8", "buf", "_tabs", "tab", "counts", "cnt", "cache"):
             if hasattr(self, k):
                 delattr(self, k)
         self.body_graphs, self.head_graphs, self._pool = {}, {}, None
@@ -713,6 +718,7 @@ class Engine:
         m = self._make_buffers(T, dev, lean)
         self.max_tokens = T
         self.state, self.conv_state, self.trans, self.kv = m["state"], m["conv_state"], m["trans"], m["kv"]
+        self.kvs = m.get("kvs")
         self.k8 = (m["k8"], m["k8s"]) if "k8" in m else None
         self.kv_scratch0 = KV_SCRATCH0
         cache_kv0 = KV_SCRATCH0 + T
@@ -780,11 +786,11 @@ class Engine:
         cfg, b, t, c, lw = self.cfg, self.buf, self.tab, self.cnt, self.layers[i]
         ai = self.attn_index[i]
         KA.qkv_norm_rope(proj, lw["q_norm"], lw["k_norm"], t["pos"], t["kvrow"], self.inv_freq, b["qbuf"], self.kv,
-                         ai, c["tok"], T, cfg, slots=slots, k8=self.k8, mrope=t.get("mrope"))
+                         ai, c["tok"], T, cfg, slots=slots, k8=self.k8, mrope=t.get("mrope"), kv8s=self.kvs)
         if slots == "all":
             mix = b["mix"][:T, :cfg.n_head * cfg.head_dim]
             KA.tree_attention(b["qbuf"], proj, self.kv, ai, mix, t["blocks"], c["blocks"], max_blocks(T),
-                              t["ranges"], cfg, k8=self.k8)
+                              t["ranges"], cfg, k8=self.k8, kv8s=self.kvs)
             return mix
 
     # ------------------------------------------------------------------ forward: bf16
@@ -846,9 +852,9 @@ class Engine:
         i = cfg.n_layer - 1
         lw, ai = self.layers[i], self.attn_index[i]
         KA.qkv_norm_rope(qg, lw["q_norm"], lw["k_norm"], t["read_pos"], t["read"], self.inv_freq, b["qr"], self.kv,
-                         ai, c["read"], R, cfg, slots="q", k8=self.k8, mrope=t.get("mrope"))
+                         ai, c["read"], R, cfg, slots="q", k8=self.k8, mrope=t.get("mrope"), kv8s=self.kvs)
         KA.tree_attention(b["qr"], qg, self.kv, ai, b["mixr"], t["read_blocks"], c["read"], R, t["ranges"], cfg,
-                          k8=self.k8, read=True)
+                          k8=self.k8, read=True, kv8s=self.kvs)
 
     def _readout(self, hr, R):
         KE.readout(hr, self.out_norm, self.letters, self.buf["logits"], self.cnt["read"], R, self.cfg.eps)
