@@ -47,6 +47,19 @@ MLP。全 FP4 的 56.2% 损失只可能来自 attention 和/或 GDN。
 2. GDN 的 FP4 误差会随 24 层状态累积，可能更敏感；
 3. 二者按层分布可能不均匀，必要时做“部分层 FP4”。
 
+### 3.1 思考解码的约束
+
+`engine/decode.py` 读的是 int8 的 `qkv_q/o_q/inp_q/out_q`（思考解码仍走 W8A8 attention/GDN +
+FP4 MLP）。因此：
+
+- prefill 用 FP4 的组件，若还要支持思考，**必须保留它的 int8 副本**；
+- 带思考时，FP4 组件的显存收益会被 int8 副本吃掉（每个组件约 0.5GB）；
+- 第一次扫描用 **`think_mode=never` + `--think-seqs 0`**，只量 prefill 的质量和显存；
+  选定配置后再用 `auto` 测思考行为，并单独记录带 int8 副本的显存。
+
+全 FP4 的 56.2% 是 auto 下测的（解码器是 int8）；扫描时要在 never 下重测所有配置，避免把
+“prefill 的 FP4 误差”和“int8 解码器的补偿”混在一起。
+
 ## 4. 配置矩阵
 
 环境变量：
@@ -59,10 +72,10 @@ MLP。全 FP4 的 56.2% 损失只可能来自 attention 和/或 GDN。
 
 | 配置 | attention | GDN | 预计显存（1k） | 质量 | 目的 |
 |---|---|---|---|---|---|
-| A | int8 | **FP4** | ~7.5 GB | 待测 | GDN 是否主因 |
-| B | **FP4** | int8 | ~7.5 GB | 待测 | attention 是否主因 |
-| C | int8 | int8 | 8.0 GB | 66.8% | 现有 MLP FP4（对照） |
-| D | **FP4** | **FP4** | ~7.0 GB | 56.2% | 全 FP4（对照） |
+| A | int8 | **FP4** | ~7.5 GB（never） | 待测 | GDN 是否主因 |
+| B | **FP4** | int8 | ~7.5 GB（never） | 待测 | attention 是否主因 |
+| C | int8 | int8 | 8.0 GB（never） | 66.8% | 现有 MLP FP4（对照） |
+| D | **FP4** | **FP4** | ~6.5–7.0 GB（never） | 56.2%（auto，需在 never 复测） | 全 FP4（对照） |
 
 第一轮 A/B 就能定位主因。若 A 或 B 单独接近 66%，再测：
 
@@ -98,10 +111,11 @@ MLP。全 FP4 的 56.2% 损失只可能来自 attention 和/或 GDN。
 
 ## 6. 评估协议
 
-- 服务器：`--precision mxfp4 --max-tokens 4096 --kv-fp8 --think-seqs 1`，
+- 第一阶段（质量/显存）：`--precision mxfp4 --max-tokens 4096 --kv-fp8 --think-seqs 0`，请求 `think_mode=never`；
+  第二阶段（思考行为）：选定配置后用 `--think-seqs 1` 和 `think_mode=auto`。
   `STARTLUX_PRISM_MXFP4_MLP=.../mxfp4/mlp_smooth.pt`，`STARTLUX_PRISM_FP4_ATTN=<0/1>`，
   `STARTLUX_PRISM_FP4_GDN=<0/1>`。
-- 217 条，`think_mode=auto`，`gate=0.6`，`think_budget=2048`（统一 cap），`return_details`。
+- 217 条；第一阶段 `think_mode=never`，第二阶段 `think_mode=auto`，`gate=0.6`，`think_budget=2048`，`return_details`。
 - 记录：gold、thought 条数/token、P50/P95 延迟、启动显存、峰值显存。
 - 参考：int8（66.8）、MLP FP4（66.8）、全 FP4（56.2）。
 - 指标：gold/217；相对 MLP FP4 的 mean |Δp|；相对 int8 的 mean |Δp|；思考行为（条数/token）。
