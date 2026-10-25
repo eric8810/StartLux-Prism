@@ -190,3 +190,27 @@ C 是旧的 `dp_b_smooth8`（auto，2048，217 条）；A 是 4k/FP8 KV。KV 格
 
 - 生产仍是 **MLP FP4 + CUTLASS**（66.8%，1.15–1.17x，bit-identical）；
 - 不要开 `STARTLUX_PRISM_FP4_GDN` / `_ATTN`，除非后续 B 能到 65.5%+。
+
+### 第二轮：B（attention FP4，GDN int8）
+
+`full_smooth.pt` 没有 attention 的 qkv/o，加载时用 Q8_0 权重 + int8 的 SmoothQuant scale
+（`W * s`，`s = attn_norm / attn_norm_s`；o 用 `1 / o_inv`）现场打包。
+
+| 测试 | B（attention FP4） | C（MLP FP4） |
+|---|---|---|
+| never，234 条 | 127/234 = **54.3%** | 133/234 = 56.8% |
+| auto，217 条 | **138/217 = 63.6%** | 145/217 = 66.8% |
+| 思考条数 / token | **99 / 109k** | 76 / 53k |
+| 平均延迟 | **11.2 s** | 5.96 s |
+
+B 和 A（GDN FP4）在 never 下同为 54.3%，auto 下 B 63.6% / A 63.1%，思考量都约 2x。
+之前的“B vs A max |Δp| = 0”是评分脚本的空字典 bug；逐条直接对比概率是明显不同的。
+
+## 11. 结论（2026-10-25）
+
+- 单独把 **GDN** 或 **attention** 换成 FP4，首轮只掉 2.5 分，但 AutoThink 下都掉 3.2–3.7 分，
+  并把思考量翻倍（76/53k → 99–105 / 107–109k），延迟 1.85–1.9x。
+- 两个组件都保留 int8 才是 66.8%；任何一个换 FP4 都过不了 65.5% 的可用线。
+- 因此 **全 FP4 的 PTQ 路线关闭**（旧的 56.2% 与“两者都掉 + 行为放大”一致），
+  除非做 QAD，否则生产继续用 **MLP FP4 + CUTLASS**（66.8%，1.15–1.17x，bit-identical）。
+- QAD 仍是唯一可能拿到全 FP4 的路线，但需要训练数据/teacher/云端 GPU；本次实验不再继续。

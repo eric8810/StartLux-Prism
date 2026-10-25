@@ -340,13 +340,29 @@ class Engine:
             return t.to(dev) if t is not None else torch.ones(n, device=dev)
 
         for i, d in enumerate(self.layers):
+            l = w.layers[i]
             d["gu_mx4"], d["down_mx4"] = mx(f"{i}.gu"), mx(f"{i}.down")
             d["post_norm_fp4"] = d["post_norm"] / sc(f"{i}.s_gu", cfg.hidden)
             if cfg.is_attention(i):
                 if self.fp4_attn:
-                    d["qkv_mx4"], d["o_mx4"] = mx(f"{i}.qkv"), mx(f"{i}.o")
-                    d["attn_norm_fp4"] = d["attn_norm"] / sc(f"{i}.s_qkv", cfg.hidden)
-                    d["o_inv"] = 1.0 / sc(f"{i}.s_o", cfg.n_head * cfg.head_dim)
+                    if f"{i}.qkv" in blob:
+                        d["qkv_mx4"], d["o_mx4"] = mx(f"{i}.qkv"), mx(f"{i}.o")
+                        d["attn_norm_fp4"] = d["attn_norm"] / sc(f"{i}.s_qkv", cfg.hidden)
+                        d["o_inv"] = 1.0 / sc(f"{i}.s_o", cfg.n_head * cfg.head_dim)
+                    else:
+                        # no attention FP4 in the side file: pack it from the Q8_0 weights with the int8
+                        # SmoothQuant scales (W * s, s = attn_norm / attn_norm_s; o uses 1 / o_inv)
+                        sc_qkv = (d["attn_norm"].float() / d["attn_norm_s"].float())
+                        W = torch.cat([l.wq.to(dev).dequant(torch.float32), l.wk.to(dev).dequant(torch.float32),
+                                       l.wv.to(dev).dequant(torch.float32)], 0) * sc_qkv[None, :]
+                        m = KQ4.pack(W)
+                        d["qkv_mx4"] = KQ4.MX4(m.q, m.s, m.n, m.k)
+                        del W
+                        W = l.wo.to(dev).dequant(torch.float32) / d["o_inv"].float()[None, :]
+                        m = KQ4.pack(W)
+                        d["o_mx4"] = KQ4.MX4(m.q, m.s, m.n, m.k)
+                        del W
+                        d["attn_norm_fp4"] = d["attn_norm_s"]
             else:
                 if self.fp4_gdn:
                     d["inp_mx4"], d["out_mx4"] = mx(f"{i}.inp"), mx(f"{i}.out")
