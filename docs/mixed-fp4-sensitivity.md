@@ -23,46 +23,66 @@
 最新（32k、FP8 KV、CUTLASS）的同条件数字：1.8k 读入 192.6 ms（int8 272.6），32 条短读入
 平均 89.9 ms（Triton FP4 104.8）；这些是 MLP FP4，不是全 FP4。
 
-## 3. 组件与敏感度假设
+## 3. 组件与敏感度假设（按代码实际路径修正）
 
-全 FP4 的路径（`engine/model.py`）：
+`_add_full_fp4` 只把 **attention 的 qkv/o** 和 **GDN 的 inp/out** 换成 MXFP4；`gu/down` 在
+MLP FP4 里已经是 FP4。因此真正的变量只有两个：
 
-- `_add_full_fp4`：qkv / o（attention）、inp / out（GDN）、gu / down（MLP）都有 MXFP4 副本；
-- `_body_full_mxfp4` / `_head_full_mxfp4`：全部投影走 `KQ4.gemm`；
-- int8 路径：`_int8_weights` 的 qkv/o/inp/out + `_mxfp4_mlp_weights` 的 MLP FP4；
-- 读出头：`_head_full_mxfp4` vs `_head_mxfp4_i8`；
-- embedding 在两个路径里都是 int8（Q8）。
+- **attention（qkv/o，8 层）**
+- **GDN（inp/out，24 层）**
 
-假设（待测）：
+不参与量化的部分：
 
-1. **读出头 / embedding** 对决策最敏感，但 FLOPs 很小；保留 int8 的代价主要是 1GB 显存。
-2. **attention qkv/o** 影响证据选择，FP4 误差会直接改路由。
-3. **GDN inp/out** 的误差会随状态累积。
-4. MLP 已经验证 FP4 无损。
+- embedding：所有路径都是 int8（Q8）；
+- 读出头（`out_norm` + `letters`）：bf16/fp32；
+- MLP：所有 mxfp4 配置都是 FP4；
+- KV：单独的 FP8 缓存。
+
+所以“保留 embed/head”不是独立开关；`_head_*` 里的 qkv/o 属于 attention，最后两层 MLP 属于
+MLP。全 FP4 的 56.2% 损失只可能来自 attention 和/或 GDN。
+
+假设：
+
+1. attention 的 FP4 误差直接影响证据选择/路由，可能更敏感；
+2. GDN 的 FP4 误差会随 24 层状态累积，可能更敏感；
+3. 二者按层分布可能不均匀，必要时做“部分层 FP4”。
 
 ## 4. 配置矩阵
 
-`STARTLUX_PRISM_FP4_KEEP` 是“**保留 int8 的组件**”列表（空 = 全 FP4）：
+环境变量：
 
-| 配置 | KEEP | 预计显存 | 相对全 FP4 的速度 | 目的 |
-|---|---|---|---|---|
-| A | `embed,head` | ~7.0 GB | 几乎不变 | 验证“只保读出头/嵌入”能否恢复质量 |
-| B | `attn` | ~7.0 GB | -3~5% | 验证 attention 是否主因 |
-| C | `gdn` | ~7.0 GB | -3~5% | 验证 GDN 是否主因 |
-| D | `attn,gdn` | ~8.0 GB | 接近 MLP FP4 | 等价于现有 MLP FP4（对照） |
-| E | `head` | ~6.5 GB | 几乎不变 | 单独验证读出头 |
-| F | `embed` | ~6.5 GB | 几乎不变 | 单独验证 embedding |
+- `STARTLUX_PRISM_FP4_ATTN=1`：attention qkv/o 用 FP4；
+- `STARTLUX_PRISM_FP4_GDN=1`：GDN inp/out 用 FP4；
+- 两者都不设 = 现有 MLP FP4（int8 attention/GDN）；
+- 两者都设 = 全 FP4；
+- `STARTLUX_PRISM_FULL_FP4=1` 保留为“两者都设”的快捷方式。
 
-可选（时间够再做）：`attn,head`、`gdn,head`、`attn,gdn,head`。
+| 配置 | attention | GDN | 预计显存（1k） | 质量 | 目的 |
+|---|---|---|---|---|---|
+| A | int8 | **FP4** | ~7.5 GB | 待测 | GDN 是否主因 |
+| B | **FP4** | int8 | ~7.5 GB | 待测 | attention 是否主因 |
+| C | int8 | int8 | 8.0 GB | 66.8% | 现有 MLP FP4（对照） |
+| D | **FP4** | **FP4** | ~7.0 GB | 56.2% | 全 FP4（对照） |
+
+第一轮 A/B 就能定位主因。若 A 或 B 单独接近 66%，再测：
+
+| 配置 | 说明 |
+|---|---|
+| E | attention 只有前 N 层 FP4（其余 int8） |
+| F | GDN 只有前 N 层 FP4（其余 int8） |
+| G | 主因组件在所有层 FP4，另一组件只在部分层 FP4 |
+
+显存估算的基线：int8 attention/GDN 各约 0.5GB，FP4 版各约 0.25GB；全 FP4 比 MLP FP4 少约
+1GB，所以是 7.0–8.0GB 区间，不是 6GB（6GB 是另一条加载路径）。
 
 ## 5. 引擎改动
 
-1. 在 `Options` / server 增加 `--fp4-keep`（或只读 env `STARTLUX_PRISM_FP4_KEEP`），默认空
-   （保持现有全 FP4 行为）。
+1. 增加 `STARTLUX_PRISM_FP4_ATTN` / `STARTLUX_PRISM_FP4_GDN`（只读 env 即可，实验阶段不加
+   server flag）；默认都不设，保持现有 MLP FP4 行为。
 2. 加载阶段：
    - 先建 int8 骨架 + `_int8_weights(mlp=False)`；
-   - 按 KEEP 决定哪些组件保留 int8、哪些用 `_add_full_fp4` 的 FP4 副本；
-   - 不保留 int8 的组件在 FP4 副本建好后释放，避免 int8+FP4 双份常驻（16GB 关键）。
+   - 按两个开关决定哪些组件用 `_add_full_fp4` 的 FP4 副本；
+   - 用 FP4 的组件不再构建 int8 副本（或建好后立即释放），避免双份常驻（16GB 关键）。
    - MLP 始终 FP4（`_mxfp4_mlp_weights`）。
 3. 前向：新增混合 body/head（或在现有两个 body 里按组件选 kernel）：
    - attention：int8 `KQ8.gemm` 或 FP4 `KQ4.gemm`；
@@ -79,7 +99,8 @@
 ## 6. 评估协议
 
 - 服务器：`--precision mxfp4 --max-tokens 4096 --kv-fp8 --think-seqs 1`，
-  `STARTLUX_PRISM_MXFP4_MLP=.../mxfp4/mlp_smooth.pt`，`STARTLUX_PRISM_FP4_KEEP=<配置>`。
+  `STARTLUX_PRISM_MXFP4_MLP=.../mxfp4/mlp_smooth.pt`，`STARTLUX_PRISM_FP4_ATTN=<0/1>`，
+  `STARTLUX_PRISM_FP4_GDN=<0/1>`。
 - 217 条，`think_mode=auto`，`gate=0.6`，`think_budget=2048`（统一 cap），`return_details`。
 - 记录：gold、thought 条数/token、P50/P95 延迟、启动显存、峰值显存。
 - 参考：int8（66.8）、MLP FP4（66.8）、全 FP4（56.2）。
@@ -114,7 +135,7 @@
 
 ## 9. 交付物
 
-- `--fp4-keep` / `STARTLUX_PRISM_FP4_KEEP` 实现；
+- `STARTLUX_PRISM_FP4_ATTN` / `STARTLUX_PRISM_FP4_GDN` 实现；
 - 一个批量脚本：依次启动各配置、跑 217 条、汇总到一张表；
 - 结果写回本文档（第 10 节）和 `docs/fp4.md`；
 - 最终建议：是否用混合 FP4 替换现有 MLP FP4；是否值得进入 QAD。
