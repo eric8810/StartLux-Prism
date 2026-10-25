@@ -185,8 +185,14 @@ class Engine:
         self.int8 = False
         self.mxfp4 = self.opt.precision == "mxfp4"
         self.full_fp4 = self.mxfp4 and os.environ.get("STARTLUX_PRISM_FULL_FP4") == "1"
+        # per-component FP4 prefill (the sensitivity sweep): attention qkv/o and/or GDN inp/out; both = full FP4
+        self.fp4_attn = self.full_fp4 or os.environ.get("STARTLUX_PRISM_FP4_ATTN") == "1"
+        self.fp4_gdn = self.full_fp4 or os.environ.get("STARTLUX_PRISM_FP4_GDN") == "1"
+        self.fp4_no_decode = os.environ.get("STARTLUX_PRISM_FP4_NO_DECODE") == "1"   # no thoughts: no int8 copies
         # mxfp4 with a calibration file: the non-MLP projections are W8A8 (Q8_0), so only the MLP differs from int8
         self.int8_rest = (self.mxfp4 and bool(self.opt.calib) and os.path.isfile(self.opt.calib))
+        self.fp4_hybrid = (self.mxfp4 and self.int8_rest and (self.fp4_attn or self.fp4_gdn)
+                           and not self.full_fp4)
         # W4A8 variant: FP4 weights with FP8 (e4m3) activations (mxf8f6f4; one weight set, 8-bit activations)
         self.act8 = self.int8_rest and not self.full_fp4 and os.environ.get("STARTLUX_PRISM_FP4_ACT8") == "1"
         # MLP token chunking: the MLP is per-token, so its [T, 2*ffn] intermediates need not span the whole batch
@@ -224,7 +230,9 @@ class Engine:
         self._side, self._side_used = None, False     # L2 prefetch stream (short int8 passes)
         if self.mxfp4 and self.int8_rest:
             amax = self._load_or_calibrate(w)
-            self._int8_weights(w, amax, mlp=not (self.mxfp4 and not self.full_fp4))
+            self._int8_weights(w, amax, mlp=not (self.mxfp4 and not self.full_fp4),
+                               attn=not (self.fp4_attn and self.fp4_no_decode),
+                               gdn=not (self.fp4_gdn and self.fp4_no_decode))
             self._mxfp4_mlp_weights(w)
         elif self.opt.precision == "int8" and self.tp is None:
             amax = self._load_or_calibrate(w)
@@ -335,13 +343,15 @@ class Engine:
             d["gu_mx4"], d["down_mx4"] = mx(f"{i}.gu"), mx(f"{i}.down")
             d["post_norm_fp4"] = d["post_norm"] / sc(f"{i}.s_gu", cfg.hidden)
             if cfg.is_attention(i):
-                d["qkv_mx4"], d["o_mx4"] = mx(f"{i}.qkv"), mx(f"{i}.o")
-                d["attn_norm_fp4"] = d["attn_norm"] / sc(f"{i}.s_qkv", cfg.hidden)
-                d["o_inv"] = 1.0 / sc(f"{i}.s_o", cfg.n_head * cfg.head_dim)
+                if self.fp4_attn:
+                    d["qkv_mx4"], d["o_mx4"] = mx(f"{i}.qkv"), mx(f"{i}.o")
+                    d["attn_norm_fp4"] = d["attn_norm"] / sc(f"{i}.s_qkv", cfg.hidden)
+                    d["o_inv"] = 1.0 / sc(f"{i}.s_o", cfg.n_head * cfg.head_dim)
             else:
-                d["inp_mx4"], d["out_mx4"] = mx(f"{i}.inp"), mx(f"{i}.out")
-                d["attn_norm_fp4"] = d["attn_norm"] / sc(f"{i}.s_inp", cfg.hidden)
-                d["out_inv"] = 1.0 / sc(f"{i}.s_out", cfg.value_dim)
+                if self.fp4_gdn:
+                    d["inp_mx4"], d["out_mx4"] = mx(f"{i}.inp"), mx(f"{i}.out")
+                    d["attn_norm_fp4"] = d["attn_norm"] / sc(f"{i}.s_inp", cfg.hidden)
+                    d["out_inv"] = 1.0 / sc(f"{i}.s_out", cfg.value_dim)
         del blob
         torch.cuda.empty_cache()
 
@@ -441,7 +451,7 @@ class Engine:
     def _mxfp4_mlp_weights(self, w):
         """On top of the W8A8 weights: add the MXFP4 MLP.  The int8 MLP stays for the thought decoder; a later FP4 decode
         path can drop it (about 4.8 GB)."""
-        if self.full_fp4:
+        if self.full_fp4 or self.fp4_hybrid:
             self._add_full_fp4(w)
         else:
             mlp = self._mxfp4_mlp(w)
@@ -460,7 +470,7 @@ class Engine:
             del mlp
         torch.cuda.empty_cache()
 
-    def _int8_weights(self, w, amax, mlp=True):
+    def _int8_weights(self, w, amax, mlp=True, attn=True, gdn=True):
         """Replace the bf16 projections by W8A8 ones (SmoothQuant with the calibrated activation ranges).  mlp=False
         leaves gu/down out: the MXFP4 copies serve both prefill and the thought decoder (one weight set, not two)."""
         dev, cfg = self.device, self.cfg
@@ -479,12 +489,15 @@ class Engine:
             if mlp in (True, "all", "down"):
                 d["down_q"], d["down_s"], d["down_inv"] = quant((l.ffn_down,), amax[(i, "down")])
             if cfg.is_attention(i):
-                d["qkv_q"], d["qkv_s"], d["attn_norm_s"] = quant((l.wq, l.wk, l.wv), amax[(i, "qkv")], d["attn_norm"])
-                d["o_q"], d["o_s"], d["o_inv"] = quant((l.wo,), amax[(i, "o")])
+                if attn:
+                    d["qkv_q"], d["qkv_s"], d["attn_norm_s"] = quant((l.wq, l.wk, l.wv), amax[(i, "qkv")],
+                                                                     d["attn_norm"])
+                    d["o_q"], d["o_s"], d["o_inv"] = quant((l.wo,), amax[(i, "o")])
             else:
-                d["inp_q"], d["inp_s"], d["attn_norm_s"] = quant((l.wqkv, l.wz, l.wbeta, l.walpha), amax[(i, "inp")],
-                                                                 d["attn_norm"])
-                d["out_q"], d["out_s"], d["out_inv"] = quant((l.wout,), amax[(i, "out")])
+                if gdn:
+                    d["inp_q"], d["inp_s"], d["attn_norm_s"] = quant((l.wqkv, l.wz, l.wbeta, l.walpha),
+                                                                     amax[(i, "inp")], d["attn_norm"])
+                    d["out_q"], d["out_s"], d["out_inv"] = quant((l.wout,), amax[(i, "out")])
             torch.cuda.empty_cache()
             bar.update(i + 1)
         self.int8 = True
@@ -1280,13 +1293,94 @@ class Engine:
         KQ4.gemm(b["fq4r"][:R], b["fs4r"][:R], lw["down_mx4"], b["hr"], R, epi=1)
         self._readout(b["hr"][:R], R)
 
+    def _body_mixed_fp4(self, T):
+        """Per-component MXFP4 prefill: attention qkv/o and/or GDN inp/out in FP4, the other W8A8; MLP always FP4.
+        The sensitivity sweep's forward (STARTLUX_PRISM_FP4_ATTN / _GDN)."""
+        cfg, b, c, L = self.cfg, self.buf, self.cnt, self.layers
+        h, n, parts = b["h"], cfg.n_layer, b.get("parts")
+        aq8, as8 = b["aq"], b["as_"]
+        aq4, as4 = b["aq4"], b["as4"]
+        pd = self.opt.pdl_mode if 0 < T <= self.opt.pdl else 0
+        pend = None
+        KE.embed(self.tab["ids"], self.embed, h, c["tok"], T)
+        try:
+            for i in range(n):
+                lw = L[i]
+                if i in self.gdn_index:
+                    if self.fp4_gdn:
+                        KE.add_norm(h, None, lw["attn_norm_fp4"], b["x"], c["tok"], T, cfg.eps, add=False)
+                        KQ4.quantize_act(b["x"][:T], aq4[:T], as4[:T])
+                        proj = b["proj"][:T, :lw["inp_mx4"].n]
+                        KQ4.gemm(aq4[:T], as4[:T], lw["inp_mx4"], proj, T, epi=0, out_stride=proj.stride(0))
+                        self._gdn_core(i, proj, T)
+                        mixg = b["mix"][:T, :cfg.value_dim]
+                        KG.gated_norm(b["o"], proj, cfg.conv_dim, lw["ssm_norm"], mixg, c["tok"], T, cfg)
+                        KQ4.quantize_act_scaled(mixg, lw["out_inv"], aq4[:T], as4[:T])
+                        KQ4.gemm(aq4[:T], as4[:T], lw["out_mx4"], h, T, epi=1)
+                    else:
+                        xq = self._rows(aq8, T, cfg.hidden)
+                        KQ.norm_q8(h, lw["attn_norm_s"], xq, as8, c["tok"], T, cfg.eps, parts=parts, pending=pend)
+                        proj = b["proj"][:T, :lw["inp_q"].shape[0]]
+                        KW.gemm(xq, as8, lw["inp_q"], lw["inp_s"], proj, c["tok"], cfg.hidden, pdl=pd)
+                        self._prefetch(T, [lw["gu_mx4"].q])
+                        self._gdn_core(i, proj, T)
+                        mq = self._rows(aq8, T, cfg.value_dim)
+                        self._q8_input(KQ.gated_norm_q8, T, b["o"], proj, cfg.conv_dim, lw["ssm_norm"],
+                                       lw["out_inv"], mq, as8, c["tok"], T, cfg)
+                        pend = self._out_proj(mq, as8, lw["out_q"], lw["out_s"], h, c["tok"], parts, pd, T)
+                        KQ.fold(h, parts, pend, c["tok"], T)
+                        pend = None
+                else:
+                    if self.fp4_attn:
+                        KE.add_norm(h, None, lw["attn_norm_fp4"], b["x"], c["tok"], T, cfg.eps, add=False)
+                        KQ4.quantize_act(b["x"][:T], aq4[:T], as4[:T])
+                        width = lw["qkv_mx4"].n
+                        proj = b["proj"][:T, :width]
+                        KQ4.gemm(aq4[:T], as4[:T], lw["qkv_mx4"], proj, T, epi=0, out_stride=proj.stride(0))
+                        if i == n - 1:
+                            self._attn_core(i, proj, T, slots="kv")
+                            return
+                        mix = self._attn_core(i, proj, T)
+                        KQ4.quantize_act_scaled(mix, lw["o_inv"], aq4[:T], as4[:T])
+                        KQ4.gemm(aq4[:T], as4[:T], lw["o_mx4"], h, T, epi=1)
+                    else:
+                        xq = self._rows(aq8, T, cfg.hidden)
+                        KQ.norm_q8(h, lw["attn_norm_s"], xq, as8, c["tok"], T, cfg.eps, parts=parts, pending=pend)
+                        proj = b["proj"][:T, :lw["qkv_q"].shape[0]]
+                        if i == n - 1:
+                            KW.gemm(xq, as8, lw["qkv_q"][self.qn:], lw["qkv_s"][self.qn:], proj[:, self.qn:],
+                                    c["tok"], cfg.hidden, pdl=pd)
+                            self._attn_core(i, proj, T, slots="kv")
+                            return
+                        KW.gemm(xq, as8, lw["qkv_q"], lw["qkv_s"], proj, c["tok"], cfg.hidden, pdl=pd)
+                        self._prefetch(T, [lw["gu_mx4"].q])
+                        mix = self._attn_core(i, proj, T)
+                        mq = self._rows(aq8, T, cfg.n_head * cfg.head_dim)
+                        self._q8_input(KQ.rows_q8, T, mix, lw["o_inv"], mq, as8, c["tok"], T)
+                        pend = self._out_proj(mq, as8, lw["o_q"], lw["o_s"], h, c["tok"], parts, pd, T)
+                        KQ.fold(h, parts, pend, c["tok"], T)
+                        pend = None
+                if self.mlp_chunk and T > self.mlp_chunk:
+                    for t0 in range(0, T, self.mlp_chunk):
+                        rows = min(self.mlp_chunk, T - t0)
+                        self._mlp_mxfp4(lw, b, h[t0:t0 + rows], rows, cfg, self._cnt(rows))
+                else:
+                    self._mlp_mxfp4(lw, b, h, T, cfg, c["tok"])
+        finally:
+            self._join_side()
+
+    def _head_mixed_fp4(self, R):
+        (self._head_full_mxfp4 if self.fp4_attn else self._head_mxfp4_i8)(R)
+
     def _body(self, T):
         (self._body_full_mxfp4 if self.full_fp4 else
+         self._body_mixed_fp4 if self.fp4_hybrid else
          self._body_mxfp4_i8 if self.mxfp4 and self.int8_rest else self._body_mxfp4 if self.mxfp4
          else self._body_w4 if self.w4 else self._body_int8 if self.int8 else self._body_bf16)(T)
 
     def _head(self, R):
-        (self._head_full_mxfp4 if self.full_fp4 else
+        (self._head_mixed_fp4 if self.fp4_hybrid else
+         self._head_full_mxfp4 if self.full_fp4 else
          self._head_mxfp4_i8 if self.mxfp4 and self.int8_rest else self._head_mxfp4 if self.mxfp4
          else self._head_w4 if self.w4 else self._head_int8 if self.int8 else self._head_bf16)(R)
 
