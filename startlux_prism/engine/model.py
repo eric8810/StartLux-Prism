@@ -380,6 +380,8 @@ class Engine:
         self.letters = w.output.dequant(torch.float32, torch.tensor(self.tok.letters)).to(dev)
         self.out_norm = w.out_norm.to(dev)
         mlp = self._mxfp4_mlp(w)
+        if KQ4.cutlass_enabled():                    # SM120: the scales in CUTLASS's layout, the data unchanged
+            mlp = {i: (KQ4.cutlass_prepare(g), KQ4.cutlass_prepare(d), sg) for i, (g, d, sg) in mlp.items()}
         self.layers, self.gdn_index, self.attn_index = [], {}, {}
         seg = lambda *m: KW4.segments(m, dev)       # noqa: E731
         bar = P.Bar("weights to the GPU (MXFP4 MLP, W4A8 rest)", len(w.layers), "layers")
@@ -443,9 +445,14 @@ class Engine:
             self._add_full_fp4(w)
         else:
             mlp = self._mxfp4_mlp(w)
+            cutlass = KQ4.cutlass_enabled()          # SM120: the scales in CUTLASS's layout; the data stays as it is
+            if cutlass:
+                P.step("MXFP4 MLP: CUTLASS SM120 kernels (interleaved scales)")
             for i, d in enumerate(self.layers):
                 # the int8 MLP stays: the thought decoder (engine/decode.py) reads it; prefill uses the MXFP4 copies
                 gu4, dn4, s_gu = mlp[i]
+                if cutlass:
+                    gu4, dn4 = KQ4.cutlass_prepare(gu4), KQ4.cutlass_prepare(dn4)
                 d["gu_mx4"], d["down_mx4"] = gu4, dn4
                 if self.act8:                    # mxf8f6f4 wants sequential e2m1 packing; keep the MXFP4 copy for A/B
                     d["gu_mx8"], d["down_mx8"] = KQ4.pack_seq(gu4), KQ4.pack_seq(dn4)

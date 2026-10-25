@@ -495,3 +495,41 @@ RTX 5060 Ti 的收益（同一形状、同一行数，表 vs 原规则）：
 
 约 **1.038x**。收益不大，因为 MLP 只占 prefill 的一部分；表的价值是免去手工猜 tile，并在换卡时用
 `python bench/w4a4_table.py` 重测（`--recheck` 只对比表中条目与原规则）。
+
+## 19. CUTLASS SM120 引擎集成（2026-10-25）
+
+在 SM120（RTX 5060 Ti）上把 MLP 的 MXFP4 GEMM 换成 CUTLASS 4.8.1 的 SM120 block-scaled
+kernel（`mx_float4_t`，ue8m0，SF=32，128×128×128，Pingpong），opt-in：
+
+```
+STARTLUX_PRISM_CUTLASS=1
+STARTLUX_PRISM_CUTLASS_LIB=<repo>/experiments/cutlass_mxfp4/libmxfp4_pp.so
+```
+
+数据路径：
+
+- 权重和激活的 **数据字节直接复用**（两者的 K 都是连续的，nibble 顺序一致）；
+- 权重 scale 在加载时重排一次（`cutlass_prepare_sfb`），激活 scale 每次调用重排（`cutlass_prepare_sfa`）；
+- 不产生第二份 2.4GB 权重；只多 3.1MB（gate|up）+ 1.6MB（down）每层的交错 scale。
+
+同二进制、同配置（32k、FP8 KV、think_seqs=4、平滑 MLP）的 A/B：
+
+| | Triton | CUTLASS | |
+|---|---|---|---|
+| 32 条读入，平均延迟 | 104.8 ms | **89.9 ms** | **1.17x** |
+| 1,799 token 读入，p50 | 222.1 ms | **192.6 ms** | **1.15x** |
+| 读入 C=1 | 9.1 req/s | **10.6 req/s** | 1.16x |
+| 读入 C=64 | 9.0 req/s | **9.6 req/s** | 1.07x |
+| 思考 8 条 C=4 budget 512 | 27.6 s | **24.3 s** | 1.14x |
+| 32k 显存 | 13.6 GB | 14.1 GB | +0.5 GB |
+
+**32 条结果 32/32 同选择，max |Δp| = 0**（逐位一致）：kernel 在 epi 0/1 上都与 Triton 的
+GEMM 一致，引擎的思考解码仍走 int8 MLP，只有 prefill 变化。
+
+限制：
+
+- 仅 sm_120/121；`.so` 不入库，用 `experiments/cutlass_mxfp4/build.sh` 构建（CUTLASS 4.8.x，
+  CUDA 12.8+）。
+- SM100 的同一模板可编译（`mxfp4_gemm_sm100.cu`），未在硬件上运行；SM103 需要示例 89 的
+  FP4 Ultra 1Sm/2Sm 结构，未实现。
+- 默认关闭，避免在没有构建 `.so` 的机器上启动失败。

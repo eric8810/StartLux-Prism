@@ -10,6 +10,7 @@ same whatever the batch it is computed in (batch invariance).
 """
 from __future__ import annotations
 
+import ctypes
 import functools
 import json
 import os
@@ -27,6 +28,7 @@ class MX4(NamedTuple):
     s: torch.Tensor          # uint8 [n, k/32] e8m0 exponents
     n: int
     k: int
+    cs: torch.Tensor | None = None   # CUTLASS-interleaved e8m0 scales (set by cutlass_prepare)
 
     @property
     def shape(self):
@@ -224,6 +226,60 @@ def pack_seq(w: MX4) -> MX4:
 
 
 # --------------------------------------------------------------------- GEMM
+# --------------------------------------------------------------------- CUTLASS (SM120/121, opt-in)
+_CUTLASS = None
+_CUTLASS_SFA = {}
+
+
+def _cutlass():
+    """The CUTLASS SM120 MXFP4 launcher, or None (STARTLUX_PRISM_CUTLASS=1 and an sm_120/121 GPU)."""
+    global _CUTLASS
+    if _CUTLASS is not None:
+        return _CUTLASS or None
+    if os.environ.get("STARTLUX_PRISM_CUTLASS", "") not in ("1", "on", "true"):
+        _CUTLASS = False
+        return None
+    major, minor = torch.cuda.get_device_capability()
+    if major != 12 or minor not in (0, 1):
+        _CUTLASS = False
+        return None
+    path = os.environ.get("STARTLUX_PRISM_CUTLASS_LIB") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "experiments", "cutlass_mxfp4", "libmxfp4_pp.so")
+    if not os.path.exists(path):
+        _CUTLASS = False
+        return None
+    lib = ctypes.CDLL(path)
+    lib.cutlass_b_sizes.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_long),
+                                    ctypes.POINTER(ctypes.c_long)]
+    lib.cutlass_sfa_bytes.argtypes = [ctypes.c_int, ctypes.c_int]
+    lib.cutlass_sfa_bytes.restype = ctypes.c_long
+    lib.cutlass_prepare_sfa.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_void_p]
+    lib.cutlass_prepare_sfb.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_void_p]
+    lib.cutlass_gemm.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
+    _CUTLASS = lib
+    return lib
+
+
+def cutlass_enabled():
+    return _cutlass() is not None
+
+
+def cutlass_prepare(w):
+    """MX4 with the scales in CUTLASS's interleaved layout (the data stays as it is; both are K-contiguous)."""
+    lib = _cutlass()
+    if lib is None or w.cs is not None:
+        return w
+    bb, sb = ctypes.c_long(), ctypes.c_long()
+    lib.cutlass_b_sizes(w.n, w.k, ctypes.byref(bb), ctypes.byref(sb))
+    cs = torch.zeros(sb.value, dtype=torch.uint8, device=w.q.device)
+    stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+    lib.cutlass_prepare_sfb(w.s.data_ptr(), cs.data_ptr(), w.n, w.k, stream)
+    return MX4(w.q, w.s, w.n, w.k, cs)
+
+
 
 @functools.lru_cache(None)
 def _table():
@@ -349,6 +405,20 @@ def gemm(a_q, a_s, w: MX4, out, n_rows, epi=0, out_stride=None):
     into the fp32 residual `out` (which then holds [n_rows, N] fp32)."""
     M, K = n_rows, w.k
     N = w.n
+    lib = _cutlass()
+    if (lib is not None and w.cs is not None and out.stride(0) == N and a_q.is_contiguous()
+            and a_s.is_contiguous()):
+        key = (M, K, a_q.device.index)
+        sfa = _CUTLASS_SFA.get(key)
+        nbytes = lib.cutlass_sfa_bytes(M, K)
+        if sfa is None or sfa.numel() < nbytes:
+            sfa = torch.zeros(nbytes, dtype=torch.uint8, device=a_q.device)
+            _CUTLASS_SFA[key] = sfa
+        stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+        lib.cutlass_prepare_sfa(a_s.data_ptr(), sfa.data_ptr(), M, K, stream)
+        lib.cutlass_gemm(a_q.data_ptr(), sfa.data_ptr(), w.q.data_ptr(), w.cs.data_ptr(), out.data_ptr(),
+                         M, N, K, epi, 0, stream)
+        return
     BM, BN, BK, GROUP_M, warps, stages = pick(M, N, K, epi)
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
     outs = out.stride(0) if out_stride is None else out_stride
