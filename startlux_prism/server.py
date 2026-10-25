@@ -167,7 +167,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--model-dir", required=True)
-    ap.add_argument("--precision", default="auto", choices=("auto", "bf16", "int8", "w4a8"),
+    ap.add_argument("--precision", default="auto", choices=("auto", "bf16", "int8", "w4a8", "mxfp4"),
                     help="auto: w4a8 for a k-quant file (Q4_K_M: its own 4-bit weights), int8 (W8A8) for Q8_0")
     ap.add_argument("--calib", default="",
                     help="int8: the activation ranges file, computed and saved on the first start (default: "
@@ -265,7 +265,7 @@ def main():
     P.step(f"StartLux-Prism: {os.path.basename(a.gguf)} ({'v1.1 AutoThink' if kind == 'auto_think' else kind}) as "
            f"{a.precision} on {gpu.name} (sm_{gpu.major}{gpu.minor}, {gpu.total_memory / 2**30:.0f} GiB)"
            + (f" and {a.tp - 1} more (tensor parallel)" if a.tp > 1 else ""))
-    thinks = kind == "auto_think" and a.precision in ("int8", "bf16", "w4a8")       # thoughts: engine/decode.py, think.py
+    thinks = kind == "auto_think" and a.precision in ("int8", "bf16", "w4a8", "mxfp4")       # thoughts: engine/decode.py, think.py
     if thinks:
         from . import think as TH
         auto = TH.folder_auto_think(a.model_dir)

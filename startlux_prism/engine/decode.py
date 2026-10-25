@@ -46,6 +46,7 @@ from ..kernels import elementwise as KE
 from ..kernels import gdn as KG
 from ..kernels import quant as KQ
 from ..kernels import w4a8 as KW4
+from ..kernels import w4a4 as KQ4
 from ..kernels import w8a8 as KW
 
 DEC_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
@@ -171,6 +172,14 @@ class Decoder:
                      hq=z(B, cfg.hidden, dtype=torch.int8), hs=z(B, cfg.hidden // KD.HEAD_G))
         else:
             b.update(x=z(B, cfg.hidden, dtype=bf), delta=z(B, cfg.hidden, dtype=bf), act=z(B, cfg.ffn, dtype=bf))
+        if e.mxfp4 and e.int8_rest and not e.full_fp4:   # MXFP4 MLP: buffers for the FP4 quantizer and GEMM
+            b.update(x4=z(B, cfg.hidden, dtype=bf), aq4=z(B, cfg.hidden // 2, dtype=torch.uint8),
+                     as4=z(B, cfg.hidden // 32, dtype=torch.uint8),
+                     act4=z(B, cfg.ffn, dtype=bf), fq4=z(B, cfg.ffn // 2, dtype=torch.uint8),
+                     fs4=z(B, cfg.ffn // 32, dtype=torch.uint8))
+            if e.act8:
+                b.update(aq8=z(B, cfg.hidden, dtype=torch.uint8), as8=z(B, cfg.hidden // 32, dtype=torch.uint8),
+                         fq8=z(B, cfg.ffn, dtype=torch.uint8), fs8=z(B, cfg.ffn // 32, dtype=torch.uint8))
         if self.attn == "split":
             self.attn_scratch = KD.attn_scratch(B, self.max_len, cfg, dev)
         self.buf = b
@@ -275,6 +284,57 @@ class Decoder:
         else:
             KD.head_q8(b["hq"], b["hs"], self.head_w, self.head_s, b["logits"], n, B)
 
+    def _layers_mxfp4(self, B):
+        """W8A8 attention/GDN, MXFP4 MLP: the engine's mixed precision with one weight set (no int8 MLP copy)."""
+        cfg, e, b, n = self.cfg, self.eng, self.buf, self.n
+        h, parts, aq, as_ = b["h"], b.get("parts"), b["aq"], b["as_"]
+        x4, aq4, as4, act4, fq4, fs4 = b["x4"], b["aq4"], b["as4"], b["act4"], b["fq4"], b["fs4"]
+        if self.tp is not None:
+            self.tp.begin(B)
+        pend = None
+        pd = e.opt.pdl_mode if 0 < B <= e.opt.pdl else 0
+        for i in range(cfg.n_layer):
+            lw = e.layers[i]
+            xq = self._rows(aq, B, cfg.hidden)
+            KQ.norm_q8(h, lw["attn_norm_s"], xq, as_, n, B, cfg.eps, parts=parts, pending=pend)
+            if i in e.gdn_index:
+                proj = b["proj"][:B, :lw["inp_q"].shape[0]]
+                KW.gemm(xq, as_, lw["inp_q"], lw["inp_s"], proj, n, cfg.hidden, pdl=pd)
+                self._gdn(i, proj, B)
+                mq = self._rows(aq, B, cfg.value_dim)
+                self._q8_input(KQ.gated_norm_q8, B, b["o"], proj, cfg.conv_dim, lw["ssm_norm"], lw["out_inv"], mq,
+                               as_, n, B, cfg)
+                pend = self._out_proj(mq, as_, lw["out_q"], lw["out_s"], h, n, parts, pd, B)
+            else:
+                proj = b["proj"][:B, :lw["qkv_q"].shape[0]]
+                KW.gemm(xq, as_, lw["qkv_q"], lw["qkv_s"], proj, n, cfg.hidden, pdl=pd)
+                mix = self._attn(i, proj, B)
+                mq = self._rows(aq, B, cfg.n_head * cfg.head_dim)
+                self._q8_input(KQ.rows_q8, B, mix, lw["o_inv"], mq, as_, n, B)
+                pend = self._out_proj(mq, as_, lw["o_q"], lw["o_s"], h, n, parts, pd, B)
+            KQ.fold(h, parts, pend, n, B)
+            KE.add_norm(h, None, lw["post_norm_fp4"], x4, n, B, cfg.eps, add=False)
+            if e.act8:
+                KQ4.quantize_act8(x4[:B], b["aq8"][:B], b["as8"][:B])
+                KQ4.gemm8(b["aq8"][:B], b["as8"][:B], lw["gu_mx8"], b["gu"][:B], B, epi=0)
+                KE.swiglu(b["gu"], act4, n, B)
+                KQ4.quantize_act8(act4[:B], b["fq8"][:B], b["fs8"][:B])
+                KQ4.gemm8(b["fq8"][:B], b["fs8"][:B], lw["down_mx8"], h, B, epi=1)
+            else:
+                KQ4.quantize_act(x4[:B], aq4[:B], as4[:B])
+                KQ4.gemm(aq4[:B], as4[:B], lw["gu_mx4"], b["gu"][:B], B, epi=0)
+                KE.swiglu(b["gu"], act4, n, B)
+                KQ4.quantize_act(act4[:B], fq4[:B], fs4[:B])
+                KQ4.gemm(fq4[:B], fs4[:B], lw["down_mx4"], h, B, epi=1)
+            pend = None
+        KQ.fold(h, parts, pend, n, B)
+        KD.head_quant(h, e.out_norm, b["hq"], b["hs"], n, B, cfg.eps)
+        if self.vshard:
+            KD.head_q8(b["hq"], b["hs"], self.head_w, self.head_s, self.vshards[self.tp.rank][:B], n, B)
+            KD.gather_vocab([x[:B] for x in self.vshards], b["logits"][:B], n, B, self.tp.sync(self.vshards))
+        else:
+            KD.head_q8(b["hq"], b["hs"], self.head_w, self.head_s, b["logits"], n, B)
+
     def _act(self, n, k):
         """W4A8 activations of n rows and k inputs (engine/model.py Engine._act): int8 [n, k], the scales [k / 256, n]
         and the split sums [k / 256, n, 16]."""
@@ -342,7 +402,8 @@ class Decoder:
         e, b, t = self.eng, self.buf, self.t
         KD.tokens(t["src"], b["tok_out"], b["tok_in"], self.n, B)
         KE.embed(b["tok_in"], e.embed, b["h"], self.n, B)
-        (self._layers_int8 if e.int8 else self._layers_w4 if e.w4 else self._layers_bf16)(B)
+        (self._layers_mxfp4 if e.mxfp4 and e.int8_rest and not e.full_fp4
+         else self._layers_int8 if e.int8 else self._layers_w4 if e.w4 else self._layers_bf16)(B)
         KD.topk(b["logits"][:B], TOPK, b["vals"][:B], b["idx"][:B])
         KD.sample(b["vals"], b["idx"], t["seed"], t["step"], t["temp"], t["top_p"], t["top_k"], b["tok_out"], self.n, B)
 
